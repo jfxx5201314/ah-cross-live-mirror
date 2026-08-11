@@ -3,12 +3,10 @@ name: AH-Cross ChatGPT Snapshot Bridge
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions supports a minimum interval of 5 minutes.
-    # Offset from minute 0 to reduce top-of-hour congestion.
     - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -28,6 +26,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
+      - name: Checkout mirror repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
 
@@ -41,37 +44,19 @@ jobs:
           JSON_URL="${RAILWAY_BASE}/api/chatgpt-snapshot?hours=36&nonce=${NONCE}"
           TXT_URL="${RAILWAY_BASE}/chatgpt.txt?hours=36&nonce=${NONCE}"
 
-          echo "Fetching JSON: ${JSON_URL}"
-          curl \
-            --fail \
-            --show-error \
-            --silent \
-            --location \
-            --retry 4 \
-            --retry-all-errors \
-            --retry-delay 3 \
-            --connect-timeout 15 \
-            --max-time 90 \
-            "${JSON_URL}" \
-            -o _site/snapshot.json
+          curl --fail --show-error --silent --location \
+            --retry 4 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 15 --max-time 90 \
+            "${JSON_URL}" -o _site/snapshot.json
 
-          echo "Fetching TXT: ${TXT_URL}"
-          curl \
-            --fail \
-            --show-error \
-            --silent \
-            --location \
-            --retry 4 \
-            --retry-all-errors \
-            --retry-delay 3 \
-            --connect-timeout 15 \
-            --max-time 90 \
-            "${TXT_URL}" \
-            -o _site/chatgpt.txt
+          curl --fail --show-error --silent --location \
+            --retry 4 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 15 --max-time 90 \
+            "${TXT_URL}" -o _site/chatgpt.txt
 
           printf '%s\n' "${NONCE}" > _site/nonce.txt
 
-      - name: Validate snapshot freshness and model version
+      - name: Validate snapshot
         shell: bash
         run: |
           set -euo pipefail
@@ -80,13 +65,10 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
-          p = Path("_site/snapshot.json")
-          data = json.loads(p.read_text(encoding="utf-8"))
+          data = json.loads(Path("_site/snapshot.json").read_text(encoding="utf-8"))
 
-          expected = "0.3.2"
-          actual = str(data.get("model_version"))
-          if actual != expected:
-              raise SystemExit(f"Wrong model_version: expected {expected}, got {actual}")
+          if str(data.get("model_version")) != "0.3.2":
+              raise SystemExit(f"Wrong model_version: {data.get('model_version')}")
 
           generated = data.get("generated_at_utc")
           if not generated:
@@ -95,21 +77,21 @@ jobs:
           dt = datetime.fromisoformat(generated.replace("Z", "+00:00"))
           age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
           if age < -120 or age > 1200:
-              raise SystemExit(f"Snapshot is not fresh enough: age_seconds={age:.1f}")
+              raise SystemExit(f"Snapshot not fresh: age_seconds={age:.1f}")
 
           pml = data.get("post_match_learning") or {}
           if not pml.get("enabled"):
-              raise SystemExit("post_match_learning is not enabled")
+              raise SystemExit("post_match_learning disabled")
           if not pml.get("guard_enabled"):
-              raise SystemExit("historical guard is not enabled")
+              raise SystemExit("historical guard disabled")
 
           print("Snapshot validation OK")
           print("generated_at_utc:", generated)
           print("counts:", data.get("counts"))
-          print("PML:", pml)
+          print("post_match_learning:", pml)
           PY
 
-      - name: Build lightweight Pages index
+      - name: Build Pages index and compact status
         shell: bash
         run: |
           set -euo pipefail
@@ -150,50 +132,7 @@ jobs:
                   "</tr>"
               )
 
-          page = f"""<!doctype html>
-          <html lang="zh-CN">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
-            <meta http-equiv="Pragma" content="no-cache">
-            <meta http-equiv="Expires" content="0">
-            <title>AH-Cross ChatGPT Mirror</title>
-            <style>
-              body{{font-family:system-ui,Arial,sans-serif;margin:18px;line-height:1.45}}
-              .meta{{margin:6px 0}}
-              table{{width:100%;border-collapse:collapse;font-size:12px}}
-              th,td{{border:1px solid #ddd;padding:5px;vertical-align:top}}
-              th{{background:#f7f7f7;position:sticky;top:0}}
-              a{{margin-right:16px}}
-            </style>
-          </head>
-          <body>
-            <h1>AH-Cross ChatGPT Mirror</h1>
-            <div class="meta"><b>Mirror generated:</b> {e(data.get("generated_at_local"))}</div>
-            <div class="meta"><b>Model:</b> {e(data.get("model_version"))}</div>
-            <div class="meta"><b>Counts:</b> FORMAL {e(counts.get("formal"))} / BACKUP {e(counts.get("backup"))} / PASS {e(counts.get("pass"))}</div>
-            <div class="meta"><b>PML:</b> enabled={e(pml.get("enabled"))}, guard={e(pml.get("guard_enabled"))}, source_rows={e(pml.get("source_rows"))}, versions={e(pml.get("source_versions"))}</div>
-            <div class="meta"><b>Latest prediction lock:</b> {e(freshness.get("latest_prediction_locked_at"))}</div>
-            <div class="meta"><b>Bridge nonce:</b> {e(nonce)}</div>
-            <p>
-              <a href="chatgpt.txt?nonce={e(nonce)}">Live TXT mirror</a>
-              <a href="snapshot.json?nonce={e(nonce)}">Live JSON mirror</a>
-              <a href="nonce.txt?nonce={e(nonce)}">Current nonce</a>
-            </p>
-            <table>
-              <thead>
-                <tr>
-                  <th>Kickoff</th><th>League</th><th>Match</th><th>Stage</th><th>Official</th>
-                  <th>Tier</th><th>Rec</th><th>Bet</th><th>EV</th><th>Conf</th><th>DQ</th>
-                  <th>Consensus</th><th>Guard</th><th>Missing</th>
-                </tr>
-              </thead>
-              <tbody>{''.join(rows)}</tbody>
-            </table>
-          </body>
-          </html>
-          """
+          page = f"""<!doctype html> <html lang="zh-CN"><head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1"> <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"> <title>AH-Cross ChatGPT Mirror</title> <style> body{{font-family:system-ui,Arial,sans-serif;margin:18px;line-height:1.45}} table{{width:100%;border-collapse:collapse;font-size:12px}} th,td{{border:1px solid #ddd;padding:5px;vertical-align:top}} th{{background:#f7f7f7;position:sticky;top:0}} </style></head><body> <h1>AH-Cross ChatGPT Mirror</h1> <p>Generated: {e(data.get("generated_at_local"))}</p> <p>Model: {e(data.get("model_version"))}</p> <p>FORMAL {e(counts.get("formal"))} / BACKUP {e(counts.get("backup"))} / PASS {e(counts.get("pass"))}</p> <p>PML enabled={e(pml.get("enabled"))}, guard={e(pml.get("guard_enabled"))}, source_rows={e(pml.get("source_rows"))}</p> <p>Nonce: {e(nonce)}</p> <p><a href="chatgpt.txt">TXT</a> | <a href="snapshot.json">JSON</a> | <a href="status.json">STATUS</a></p> <table><thead><tr> <th>Kickoff</th><th>League</th><th>Match</th><th>Stage</th><th>Official</th> <th>Tier</th><th>Rec</th><th>Bet</th><th>EV</th><th>Conf</th><th>DQ</th> <th>Consensus</th><th>Guard</th><th>Missing</th> </tr></thead><tbody>{''.join(rows)}</tbody></table> </body></html>"""
           Path("_site/index.html").write_text(page, encoding="utf-8")
 
           status = {
@@ -219,3 +158,30 @@ jobs:
       - name: Deploy mirror to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Publish machine-readable live branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/ahcross-live
+          cp _site/chatgpt.txt /tmp/ahcross-live/chatgpt.txt
+          cp _site/snapshot.json /tmp/ahcross-live/snapshot.json
+          cp _site/status.json /tmp/ahcross-live/status.json
+          cp _site/nonce.txt /tmp/ahcross-live/nonce.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan live
+          git rm -rf . >/dev/null 2>&1 || true
+          rm -rf .github README.md _site 2>/dev/null || true
+
+          cp /tmp/ahcross-live/chatgpt.txt .
+          cp /tmp/ahcross-live/snapshot.json .
+          cp /tmp/ahcross-live/status.json .
+          cp /tmp/ahcross-live/nonce.txt .
+
+          git add chatgpt.txt snapshot.json status.json nonce.txt
+          git commit -m "Update AH-Cross live snapshot"
+          git push origin live --force
