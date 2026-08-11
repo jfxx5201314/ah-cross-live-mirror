@@ -16,7 +16,8 @@ concurrency:
 
 env:
   RAILWAY_BASE: https://ah-cross-autolearn-production-4c96.up.railway.app
-  EXPECTED_MODEL_VERSION: "0.3.2"
+  EXPECTED_MODEL_VERSION: "0.4.0"
+  EXPECTED_BUILD: "V0.4.0-YDC2"
 
 jobs:
   mirror:
@@ -39,7 +40,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _site
-
           NONCE="$(date +%s)"
           JSON_URL="${RAILWAY_BASE}/api/chatgpt-snapshot?hours=36&nonce=${NONCE}"
           TXT_URL="${RAILWAY_BASE}/chatgpt.txt?hours=36&nonce=${NONCE}"
@@ -61,19 +61,22 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json
+          import json, os
           from datetime import datetime, timezone
           from pathlib import Path
 
           data = json.loads(Path("_site/snapshot.json").read_text(encoding="utf-8"))
+          expected = os.environ["EXPECTED_MODEL_VERSION"]
+          expected_build = os.environ["EXPECTED_BUILD"]
 
-          if str(data.get("model_version")) != "0.3.2":
-              raise SystemExit(f"Wrong model_version: {data.get('model_version')}")
+          if str(data.get("model_version")) != expected:
+              raise SystemExit(f"Wrong model_version: {data.get('model_version')} expected={expected}")
+          if str(data.get("build")) != expected_build:
+              raise SystemExit(f"Wrong build: {data.get('build')} expected={expected_build}")
 
           generated = data.get("generated_at_utc")
           if not generated:
               raise SystemExit("Missing generated_at_utc")
-
           dt = datetime.fromisoformat(generated.replace("Z", "+00:00"))
           age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
           if age < -120 or age > 1200:
@@ -85,10 +88,25 @@ jobs:
           if not pml.get("guard_enabled"):
               raise SystemExit("historical guard disabled")
 
+          ms = data.get("multisource") or {}
+          if not ms.get("enabled"):
+              raise SystemExit("multisource disabled")
+          if ms.get("decision_mode") != "shadow":
+              raise SystemExit(f"unexpected multisource decision mode: {ms.get('decision_mode')}")
+          if ms.get("search_provider") != "youcom":
+              raise SystemExit(f"unexpected search provider: {ms.get('search_provider')}")
+          if not ms.get("web_search_ready"):
+              raise SystemExit("You.com web_search_ready is false")
+          if int(ms.get("search_daily_limit") or 0) < 1:
+              raise SystemExit(f"invalid search_daily_limit: {ms.get('search_daily_limit')}")
+          last_sweep = ms.get("last_sweep") or {}
+          if last_sweep and last_sweep.get("status") not in (None, "ok"):
+              raise SystemExit(f"last multisource sweep not ok: {last_sweep}")
+
           print("Snapshot validation OK")
           print("generated_at_utc:", generated)
           print("counts:", data.get("counts"))
-          print("post_match_learning:", pml)
+          print("multisource:", ms)
           PY
 
       - name: Build Pages index and compact status
@@ -96,23 +114,24 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import html
-          import json
+          import html, json
           from pathlib import Path
 
           data = json.loads(Path("_site/snapshot.json").read_text(encoding="utf-8"))
           nonce = Path("_site/nonce.txt").read_text(encoding="utf-8").strip()
           counts = data.get("counts") or {}
           pml = data.get("post_match_learning") or {}
+          ms_top = data.get("multisource") or {}
           freshness = data.get("freshness") or {}
 
-          def e(x):
-              return html.escape(str(x if x is not None else ""))
-
+          def e(x): return html.escape(str(x if x is not None else ""))
           rows = []
           for item in data.get("all_target_rows") or []:
               guard = item.get("historical_guard") or {}
               missing = ",".join(item.get("critical_missing") or [])
+              ms = item.get("multisource") or {}
+              signals = ",".join(str(x.get("signal") or x) if isinstance(x, dict) else str(x) for x in (ms.get("signals") or [])[:3])
+              ms_text = f"domains={ms.get('independent_domains') or ms.get('source_count') or 0}; {signals}"
               rows.append(
                   "<tr>"
                   f"<td>{e(item.get('kickoff_local'))}</td>"
@@ -128,11 +147,12 @@ jobs:
                   f"<td>{e(item.get('dq'))}</td>"
                   f"<td>{e(item.get('consensus_share'))}</td>"
                   f"<td>{e(guard.get('action'))}/{e(guard.get('risk_score'))}/{e(guard.get('independent_bad_families'))}</td>"
+                  f"<td>{e(ms_text)}</td>"
                   f"<td>{e(missing)}</td>"
                   "</tr>"
               )
 
-          page = f"""<!doctype html> <html lang="zh-CN"><head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width,initial-scale=1"> <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"> <title>AH-Cross ChatGPT Mirror</title> <style> body{{font-family:system-ui,Arial,sans-serif;margin:18px;line-height:1.45}} table{{width:100%;border-collapse:collapse;font-size:12px}} th,td{{border:1px solid #ddd;padding:5px;vertical-align:top}} th{{background:#f7f7f7;position:sticky;top:0}} </style></head><body> <h1>AH-Cross ChatGPT Mirror</h1> <p>Generated: {e(data.get("generated_at_local"))}</p> <p>Model: {e(data.get("model_version"))}</p> <p>FORMAL {e(counts.get("formal"))} / BACKUP {e(counts.get("backup"))} / PASS {e(counts.get("pass"))}</p> <p>PML enabled={e(pml.get("enabled"))}, guard={e(pml.get("guard_enabled"))}, source_rows={e(pml.get("source_rows"))}</p> <p>Nonce: {e(nonce)}</p> <p><a href="chatgpt.txt">TXT</a> | <a href="snapshot.json">JSON</a> | <a href="status.json">STATUS</a></p> <table><thead><tr> <th>Kickoff</th><th>League</th><th>Match</th><th>Stage</th><th>Official</th> <th>Tier</th><th>Rec</th><th>Bet</th><th>EV</th><th>Conf</th><th>DQ</th> <th>Consensus</th><th>Guard</th><th>Missing</th> </tr></thead><tbody>{''.join(rows)}</tbody></table> </body></html>"""
+          page = f"""<!doctype html> <html lang="zh-CN"><head> <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"> <title>AH-Cross ChatGPT Mirror</title> <style>body{{font-family:system-ui,Arial,sans-serif;margin:18px;line-height:1.45}}table{{width:100%;border-collapse:collapse;font-size:12px}}th,td{{border:1px solid #ddd;padding:5px;vertical-align:top}}th{{background:#f7f7f7;position:sticky;top:0}}</style> </head><body> <h1>AH-Cross ChatGPT Mirror</h1> <p>Generated: {e(data.get('generated_at_local'))}</p> <p>Model: {e(data.get('model_version'))} / Build: {e(data.get('build'))}</p> <p>FORMAL {e(counts.get('formal'))} / BACKUP {e(counts.get('backup'))} / PASS {e(counts.get('pass'))}</p> <p>PML enabled={e(pml.get('enabled'))}, guard={e(pml.get('guard_enabled'))}, source_rows={e(pml.get('source_rows'))}</p> <p>MS provider={e(ms_top.get('search_provider'))}, ready={e(ms_top.get('web_search_ready'))}, mode={e(ms_top.get('decision_mode'))}, usage={e(ms_top.get('search_usage_today'))}/{e(ms_top.get('search_daily_limit'))}</p> <p>Nonce: {e(nonce)}</p> <p><a href="chatgpt.txt">TXT</a> | <a href="snapshot.json">JSON</a> | <a href="status.json">STATUS</a></p> <table><thead><tr><th>Kickoff</th><th>League</th><th>Match</th><th>Stage</th><th>Official</th><th>Tier</th><th>Rec</th><th>Bet</th><th>EV</th><th>Conf</th><th>DQ</th><th>Consensus</th><th>Guard</th><th>MS</th><th>Missing</th></tr></thead><tbody>{''.join(rows)}</tbody></table> </body></html>"""
           Path("_site/index.html").write_text(page, encoding="utf-8")
 
           status = {
@@ -140,14 +160,13 @@ jobs:
               "generated_at_utc": data.get("generated_at_utc"),
               "generated_at_local": data.get("generated_at_local"),
               "model_version": data.get("model_version"),
+              "build": data.get("build"),
               "counts": counts,
               "post_match_learning": pml,
+              "multisource": ms_top,
               "latest_prediction_locked_at": freshness.get("latest_prediction_locked_at"),
           }
-          Path("_site/status.json").write_text(
-              json.dumps(status, ensure_ascii=False, separators=(",", ":")),
-              encoding="utf-8",
-          )
+          Path("_site/status.json").write_text(json.dumps(status, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
           PY
 
       - name: Upload Pages artifact
@@ -163,7 +182,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p /tmp/ahcross-live
           cp _site/chatgpt.txt /tmp/ahcross-live/chatgpt.txt
           cp _site/snapshot.json /tmp/ahcross-live/snapshot.json
@@ -172,16 +190,13 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git checkout --orphan live
           git rm -rf . >/dev/null 2>&1 || true
           rm -rf .github README.md _site 2>/dev/null || true
-
           cp /tmp/ahcross-live/chatgpt.txt .
           cp /tmp/ahcross-live/snapshot.json .
           cp /tmp/ahcross-live/status.json .
           cp /tmp/ahcross-live/nonce.txt .
-
           git add chatgpt.txt snapshot.json status.json nonce.txt
           git commit -m "Update AH-Cross live snapshot"
           git push origin live --force
