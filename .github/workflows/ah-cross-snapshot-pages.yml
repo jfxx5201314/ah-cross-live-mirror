@@ -1,4 +1,4 @@
-name: AH-Cross ChatGPT Snapshot Bridge
+name: AH-Cross ChatGPT Snapshot Bridge UF1
 
 on:
   workflow_dispatch:
@@ -16,8 +16,13 @@ concurrency:
 
 env:
   RAILWAY_BASE: https://ah-cross-autolearn-production-4c96.up.railway.app
-  EXPECTED_MODEL_VERSION: "0.4.0"
-  EXPECTED_BUILD: "V0.4.0-YDC2"
+  EXPECTED_MODEL_VERSION: "0.5.0"
+  EXPECTED_MIN_EV: "0.055"
+  EXPECTED_MIN_CONFIDENCE: "0.62"
+  EXPECTED_FINAL_MIN_DATA_QUALITY: "0.72"
+  EXPECTED_MARKET_CONSENSUS_MIN_SHARE: "0.60"
+  EXPECTED_AUTO_FINAL_LOCK_MAX_MINUTES: "18"
+  V040_BASELINE_SOURCE_ROWS: "800"
 
 jobs:
   mirror:
@@ -66,47 +71,184 @@ jobs:
           from pathlib import Path
 
           data = json.loads(Path("_site/snapshot.json").read_text(encoding="utf-8"))
-          expected = os.environ["EXPECTED_MODEL_VERSION"]
-          expected_build = os.environ["EXPECTED_BUILD"]
 
-          if str(data.get("model_version")) != expected:
-              raise SystemExit(f"Wrong model_version: {data.get('model_version')} expected={expected}")
-          if str(data.get("build")) != expected_build:
-              raise SystemExit(f"Wrong build: {data.get('build')} expected={expected_build}")
+          def fail(msg):
+              raise SystemExit(msg)
 
-          generated = data.get("generated_at_utc")
-          if not generated:
-              raise SystemExit("Missing generated_at_utc")
-          dt = datetime.fromisoformat(generated.replace("Z", "+00:00"))
-          age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
-          if age < -120 or age > 1200:
-              raise SystemExit(f"Snapshot not fresh: age_seconds={age:.1f}")
+          def as_float(v):
+              try:
+                  return float(v)
+              except Exception:
+                  return None
+
+          def as_int(v):
+              try:
+                  return int(v)
+              except Exception:
+                  return None
+
+          def norm(v):
+              return str(v or "").strip().lower()
+
+          expected_version = os.environ["EXPECTED_MODEL_VERSION"]
+          model_version = data.get("model_version") or data.get("version")
+          if model_version is not None and str(model_version) != expected_version:
+              fail(f"Wrong model_version: {model_version} expected={expected_version}")
+
+          build = data.get("build") or data.get("build_tag")
+          app = data.get("app") or data.get("app_name")
+          build_text = f"{build or ''} {app or ''}".lower()
+          if (build is not None or app is not None) and ("uf1" not in build_text and "unified final" not in build_text):
+              fail(f"Wrong UF1 build/app: build={build!r} app={app!r}")
+
+          generated = data.get("generated_at_utc") or data.get("generated_at") or data.get("timestamp")
+          if generated:
+              dt = datetime.fromisoformat(str(generated).replace("Z", "+00:00"))
+              age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+              if age < -120 or age > 1200:
+                  fail(f"Snapshot not fresh: age_seconds={age:.1f}")
+
+          fri = data.get("frozen_rules_integrity")
+          if isinstance(fri, dict) and fri:
+              if fri.get("ok") is False:
+                  fail(f"frozen_rules_integrity.ok=false: {json.dumps(fri, ensure_ascii=False)}")
+
+              mismatches = fri.get("mismatches")
+              if isinstance(mismatches, dict) and mismatches:
+                  fail(f"frozen_rules_integrity mismatches: {json.dumps(mismatches, ensure_ascii=False)}")
+              if isinstance(mismatches, list) and mismatches:
+                  fail(f"frozen_rules_integrity mismatches: {json.dumps(mismatches, ensure_ascii=False)}")
+
+              effective = fri.get("effective") if isinstance(fri.get("effective"), dict) else {}
+              expected = fri.get("expected") if isinstance(fri.get("expected"), dict) else {}
+
+              required = {
+                  "MIN_EV": float(os.environ["EXPECTED_MIN_EV"]),
+                  "MIN_CONFIDENCE": float(os.environ["EXPECTED_MIN_CONFIDENCE"]),
+                  "FINAL_MIN_DATA_QUALITY": float(os.environ["EXPECTED_FINAL_MIN_DATA_QUALITY"]),
+                  "MARKET_CONSENSUS_MIN_SHARE": float(os.environ["EXPECTED_MARKET_CONSENSUS_MIN_SHARE"]),
+                  "AUTO_FINAL_LOCK_MAX_MINUTES": float(os.environ["EXPECTED_AUTO_FINAL_LOCK_MAX_MINUTES"]),
+              }
+
+              for key, want in required.items():
+                  ev = effective.get(key)
+                  ex = expected.get(key)
+
+                  if ev is not None:
+                      got = as_float(ev)
+                      if got is None or abs(got - want) > 1e-9:
+                          fail(f"UF1 effective mismatch {key}: got={ev!r} expected={want}")
+
+                  if ex is not None:
+                      got = as_float(ex)
+                      if got is None or abs(got - want) > 1e-9:
+                          fail(f"UF1 expected mismatch {key}: got={ex!r} expected={want}")
+
+                  if ev is not None and ex is not None:
+                      evf, exf = as_float(ev), as_float(ex)
+                      if evf is None or exf is None or abs(evf - exf) > 1e-9:
+                          fail(f"effective != expected for {key}: effective={ev!r} expected={ex!r}")
+
+          db = data.get("database")
+          if isinstance(db, dict) and db:
+              backend = norm(db.get("backend") or db.get("type") or db.get("engine"))
+              if backend and backend not in {"postgresql", "postgres", "postgresql/psycopg"}:
+                  fail(f"Unexpected database backend: {backend}")
+              if db.get("connected") is False:
+                  fail("database.connected=false")
+              if db.get("persistent") is False:
+                  fail("database.persistent=false")
+
+          def check_status_block(label, block):
+              if not isinstance(block, dict) or not block:
+                  return
+              status = norm(block.get("status") or block.get("state") or block.get("overall_status"))
+              if status in {"failed", "failure", "error", "down", "unhealthy", "stopped"}:
+                  fail(f"{label} explicit failure: {json.dumps(block, ensure_ascii=False)}")
+              if block.get("ok") is False:
+                  fail(f"{label}.ok=false: {json.dumps(block, ensure_ascii=False)}")
+              if label == "scheduler" and block.get("enabled") is False:
+                  fail("scheduler.enabled=false")
+
+          check_status_block("scheduler", data.get("scheduler"))
+          check_status_block("final_sweep", data.get("final_sweep") or data.get("final-sweep"))
+          check_status_block("settlement", data.get("settlement"))
 
           pml = data.get("post_match_learning") or {}
-          if not pml.get("enabled"):
-              raise SystemExit("post_match_learning disabled")
-          if not pml.get("guard_enabled"):
-              raise SystemExit("historical guard disabled")
+          if isinstance(pml, dict) and pml:
+              versions = pml.get("source_versions") or pml.get("versions") or pml.get("model_versions") or []
+              if isinstance(versions, list) and versions and "0.4.0" not in [str(v) for v in versions]:
+                  fail(f"V0.4.0 history missing from post_match_learning versions: {versions}")
+
+              source_rows = as_int(pml.get("source_rows"))
+              baseline = int(os.environ["V040_BASELINE_SOURCE_ROWS"])
+              if source_rows is not None and source_rows < baseline:
+                  fail(f"post_match_learning source_rows regressed: {source_rows} < {baseline}")
+
+              if pml.get("enabled") is False:
+                  fail("post_match_learning disabled")
+              if pml.get("guard_enabled") is False:
+                  fail("historical guard disabled")
+
+          rows = data.get("all_target_rows") or data.get("predictions") or []
+          directional_final = []
+          no_bet_final = []
+
+          if isinstance(rows, list):
+              for item in rows:
+                  if not isinstance(item, dict):
+                      continue
+                  stage = norm(item.get("stage") or item.get("lock_type"))
+                  official = item.get("official")
+                  recommendation = norm(item.get("recommendation") or item.get("decision"))
+                  side = norm(item.get("side") or item.get("selection"))
+
+                  is_final = stage in {"final", "official final", "official_final"} or bool(item.get("is_final"))
+                  is_official = official is True or norm(official) in {"true", "1", "yes", "official"}
+                  is_no_bet = (
+                      recommendation in {"no bet", "no_bet", "pass", "放弃"}
+                      or side in {"no bet", "no_bet", "pass", "放弃", ""}
+                  )
+
+                  if is_final and is_official:
+                      if is_no_bet:
+                          no_bet_final.append(item)
+                      else:
+                          directional_final.append(item)
+
+          audit = {
+              "directional_official_final": len(directional_final),
+              "no_bet_official_final_excluded": len(no_bet_final),
+          }
+          Path("_site/official-final-audit.json").write_text(
+              json.dumps(audit, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8"
+          )
 
           ms = data.get("multisource") or {}
-          if not ms.get("enabled"):
-              raise SystemExit("multisource disabled")
-          if ms.get("decision_mode") != "shadow":
-              raise SystemExit(f"unexpected multisource decision mode: {ms.get('decision_mode')}")
-          if ms.get("search_provider") != "youcom":
-              raise SystemExit(f"unexpected search provider: {ms.get('search_provider')}")
-          if not ms.get("web_search_ready"):
-              raise SystemExit("You.com web_search_ready is false")
-          if int(ms.get("search_daily_limit") or 0) < 1:
-              raise SystemExit(f"invalid search_daily_limit: {ms.get('search_daily_limit')}")
-          last_sweep = ms.get("last_sweep") or {}
-          if last_sweep and last_sweep.get("status") not in (None, "ok"):
-              raise SystemExit(f"last multisource sweep not ok: {last_sweep}")
+          if isinstance(ms, dict) and ms:
+              if ms.get("enabled") is False:
+                  fail("multisource disabled")
+              if ms.get("decision_mode") is not None and ms.get("decision_mode") != "shadow":
+                  fail(f"unexpected multisource decision mode: {ms.get('decision_mode')}")
+              if ms.get("search_provider") is not None and ms.get("search_provider") != "youcom":
+                  fail(f"unexpected search provider: {ms.get('search_provider')}")
+              if ms.get("web_search_ready") is False:
+                  fail("You.com web_search_ready is false")
+              if ms.get("search_daily_limit") is not None and int(ms.get("search_daily_limit") or 0) < 1:
+                  fail(f"invalid search_daily_limit: {ms.get('search_daily_limit')}")
+              last_sweep = ms.get("last_sweep") or {}
+              if isinstance(last_sweep, dict) and last_sweep:
+                  s = norm(last_sweep.get("status"))
+                  if s and s not in {"ok", "success", "completed"}:
+                      fail(f"last multisource sweep not ok: {last_sweep}")
 
-          print("Snapshot validation OK")
-          print("generated_at_utc:", generated)
-          print("counts:", data.get("counts"))
-          print("multisource:", ms)
+          print("UF1 snapshot validation OK")
+          print("model_version:", model_version)
+          print("build/app:", build, app)
+          print("generated:", generated)
+          print("frozen_rules_integrity:", fri)
+          print("official_final_audit:", audit)
           PY
 
       - name: Build Pages index and compact status
@@ -119,18 +261,31 @@ jobs:
 
           data = json.loads(Path("_site/snapshot.json").read_text(encoding="utf-8"))
           nonce = Path("_site/nonce.txt").read_text(encoding="utf-8").strip()
-          counts = data.get("counts") or {}
+          audit_path = Path("_site/official-final-audit.json")
+          audit = json.loads(audit_path.read_text(encoding="utf-8")) if audit_path.exists() else {}
+
+          counts = data.get("counts") or data.get("official_final_counts") or {}
           pml = data.get("post_match_learning") or {}
           ms_top = data.get("multisource") or {}
           freshness = data.get("freshness") or {}
+          fri = data.get("frozen_rules_integrity") or {}
+          db = data.get("database") or {}
+          scheduler = data.get("scheduler") or {}
+          final_sweep = data.get("final_sweep") or data.get("final-sweep") or {}
+          settlement = data.get("settlement") or {}
 
-          def e(x): return html.escape(str(x if x is not None else ""))
+          def e(x):
+              return html.escape(str(x if x is not None else ""))
+
           rows = []
           for item in data.get("all_target_rows") or []:
               guard = item.get("historical_guard") or {}
               missing = ",".join(item.get("critical_missing") or [])
               ms = item.get("multisource") or {}
-              signals = ",".join(str(x.get("signal") or x) if isinstance(x, dict) else str(x) for x in (ms.get("signals") or [])[:3])
+              signals = ",".join(
+                  str(x.get("signal") or x) if isinstance(x, dict) else str(x)
+                  for x in (ms.get("signals") or [])[:3]
+              )
               ms_text = f"domains={ms.get('independent_domains') or ms.get('source_count') or 0}; {signals}"
               rows.append(
                   "<tr>"
@@ -152,7 +307,8 @@ jobs:
                   "</tr>"
               )
 
-          page = f"""<!doctype html> <html lang="zh-CN"><head> <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"> <title>AH-Cross ChatGPT Mirror</title> <style>body{{font-family:system-ui,Arial,sans-serif;margin:18px;line-height:1.45}}table{{width:100%;border-collapse:collapse;font-size:12px}}th,td{{border:1px solid #ddd;padding:5px;vertical-align:top}}th{{background:#f7f7f7;position:sticky;top:0}}</style> </head><body> <h1>AH-Cross ChatGPT Mirror</h1> <p>Generated: {e(data.get('generated_at_local'))}</p> <p>Model: {e(data.get('model_version'))} / Build: {e(data.get('build'))}</p> <p>FORMAL {e(counts.get('formal'))} / BACKUP {e(counts.get('backup'))} / PASS {e(counts.get('pass'))}</p> <p>PML enabled={e(pml.get('enabled'))}, guard={e(pml.get('guard_enabled'))}, source_rows={e(pml.get('source_rows'))}</p> <p>MS provider={e(ms_top.get('search_provider'))}, ready={e(ms_top.get('web_search_ready'))}, mode={e(ms_top.get('decision_mode'))}, usage={e(ms_top.get('search_usage_today'))}/{e(ms_top.get('search_daily_limit'))}</p> <p>Nonce: {e(nonce)}</p> <p><a href="chatgpt.txt">TXT</a> | <a href="snapshot.json">JSON</a> | <a href="status.json">STATUS</a></p> <table><thead><tr><th>Kickoff</th><th>League</th><th>Match</th><th>Stage</th><th>Official</th><th>Tier</th><th>Rec</th><th>Bet</th><th>EV</th><th>Conf</th><th>DQ</th><th>Consensus</th><th>Guard</th><th>MS</th><th>Missing</th></tr></thead><tbody>{''.join(rows)}</tbody></table> </body></html>"""
+          page = f'''<!doctype html> <html lang="zh-CN"><head> <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0"> <title>AH-Cross V0.5.0-UF1 Mirror</title> <style> body{{font-family:system-ui,Arial,sans-serif;margin:18px;line-height:1.45}} table{{width:100%;border-collapse:collapse;font-size:12px}} th,td{{border:1px solid #ddd;padding:5px;vertical-align:top}} th{{background:#f7f7f7;position:sticky;top:0}} </style></head><body> <h1>AH-Cross V0.5.0-UF1 Live Mirror</h1> <p>Generated: {e(data.get('generated_at_local') or data.get('generated_at_utc'))}</p> <p>Model: {e(data.get('model_version'))} / Build: {e(data.get('build'))} / App: {e(data.get('app'))}</p> <p>Frozen rules OK: {e(fri.get('ok'))}</p> <p>Official Final directional: {e(audit.get('directional_official_final'))}; NO BET excluded: {e(audit.get('no_bet_official_final_excluded'))}</p> <p>Database: backend={e(db.get('backend'))}, connected={e(db.get('connected'))}, persistent={e(db.get('persistent'))}</p> <p>Scheduler={e(scheduler)} / Final sweep={e(final_sweep)} / Settlement={e(settlement)}</p> <p>PML enabled={e(pml.get('enabled'))}, guard={e(pml.get('guard_enabled'))}, source_rows={e(pml.get('source_rows'))}</p> <p>MS provider={e(ms_top.get('search_provider'))}, ready={e(ms_top.get('web_search_ready'))}, mode={e(ms_top.get('decision_mode'))}, usage={e(ms_top.get('search_usage_today'))}/{e(ms_top.get('search_daily_limit'))}</p> <p>Nonce: {e(nonce)}</p> <p><a href="chatgpt.txt">TXT</a> | <a href="snapshot.json">JSON</a> | <a href="status.json">STATUS</a> | <a href="official-final-audit.json">OFFICIAL FINAL AUDIT</a></p> <table><thead><tr> <th>Kickoff</th><th>League</th><th>Match</th><th>Stage</th><th>Official</th><th>Tier</th><th>Rec</th><th>Bet</th><th>EV</th><th>Conf</th><th>DQ</th><th>Consensus</th><th>Guard</th><th>MS</th><th>Missing</th> </tr></thead><tbody>{''.join(rows)}</tbody></table> </body></html>'''
+
           Path("_site/index.html").write_text(page, encoding="utf-8")
 
           status = {
@@ -161,12 +317,23 @@ jobs:
               "generated_at_local": data.get("generated_at_local"),
               "model_version": data.get("model_version"),
               "build": data.get("build"),
+              "app": data.get("app"),
+              "database": db,
+              "scheduler": scheduler,
+              "final_sweep": final_sweep,
+              "settlement": settlement,
               "counts": counts,
+              "official_final_audit": audit,
+              "frozen_rules_integrity": fri,
               "post_match_learning": pml,
               "multisource": ms_top,
               "latest_prediction_locked_at": freshness.get("latest_prediction_locked_at"),
           }
-          Path("_site/status.json").write_text(json.dumps(status, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+          Path("_site/status.json").write_text(
+              json.dumps(status, ensure_ascii=False, separators=(",", ":")) + "\n",
+              encoding="utf-8"
+          )
           PY
 
       - name: Upload Pages artifact
@@ -187,16 +354,21 @@ jobs:
           cp _site/snapshot.json /tmp/ahcross-live/snapshot.json
           cp _site/status.json /tmp/ahcross-live/status.json
           cp _site/nonce.txt /tmp/ahcross-live/nonce.txt
+          cp _site/official-final-audit.json /tmp/ahcross-live/official-final-audit.json
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git checkout --orphan live
           git rm -rf . >/dev/null 2>&1 || true
           rm -rf .github README.md _site 2>/dev/null || true
+
           cp /tmp/ahcross-live/chatgpt.txt .
           cp /tmp/ahcross-live/snapshot.json .
           cp /tmp/ahcross-live/status.json .
           cp /tmp/ahcross-live/nonce.txt .
-          git add chatgpt.txt snapshot.json status.json nonce.txt
-          git commit -m "Update AH-Cross live snapshot"
+          cp /tmp/ahcross-live/official-final-audit.json .
+
+          git add chatgpt.txt snapshot.json status.json nonce.txt official-final-audit.json
+          git commit -m "Update AH-Cross V0.5.0-UF1 live snapshot"
           git push origin live --force
