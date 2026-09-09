@@ -229,7 +229,7 @@ jobs:
           if isinstance(ms, dict) and ms:
               if ms.get("enabled") is False:
                   fail("multisource disabled")
-              if ms.get("decision_mode") is not None and ms.get("decision_mode") != "shadow":
+              if ms.get("decision_mode") is not None and ms.get("decision_mode") not in {"shadow", "risk_gate"}:
                   fail(f"unexpected multisource decision mode: {ms.get('decision_mode')}")
               if ms.get("search_provider") is not None and ms.get("search_provider") != "youcom":
                   fail(f"unexpected search provider: {ms.get('search_provider')}")
